@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Десятка — мини-игра</title>
+<style>
+  html,body{height:100%;margin:0;background:#0b1220;color:#fff;font-family:Inter,system-ui,Arial}
+  #game{display:flex;align-items:center;justify-content:center;height:100vh}
+  canvas{background:linear-gradient(180deg,#091024,#07111b);border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.6)}
+  .hint{position:fixed;left:12px;bottom:12px;color:#bfc7d6;font-size:13px}
+</style>
+</head>
+<body>
+<div id="game"><canvas id="c" width="420" height="740"></canvas></div>
+<div class="hint">Открыто как WebApp Telegram. Если игра не видит тебя — открой из бота.</div>
+
+<script>
+/* Configuration */
+const SERVER_URL = 'https://desyatka-production.up.railway.app'; // <- Railway URL (already embedded)
+const BOT_USERNAME = 'desyatkagame_bot'; // without @
+
+/* Telegram WebApp helper */
+const tg = window.Telegram ? window.Telegram.WebApp : null;
+if(tg && tg.expand) try{ tg.expand(); }catch(e){}
+
+/* Game variables and UI logic */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+let state = 'menu'; // menu | playing | gameover
+let score = 0, highScore = 0;
+let player = {x:W/2,y:H-80,w:72,h:18,vx:0};
+let coins = [], obstacles = [], lastSpawn=0, spawnInterval=700, gravity=0.18, speedMultiplier=1;
+let lastTime=0, touchX=null, uiButton=null;
+let username = 'Игрок';
+if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) {
+  const u = tg.initDataUnsafe.user;
+  username = u.username || u.first_name || ('user_' + (u.id||'guest'));
+  // claim invite (server-side)
+  fetch(`${SERVER_URL}/claim_invite`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ user_id: u.id, name: username })
+  }).catch(()=>{});
+}
+
+/* Sounds */
+const sndCoin = new Audio('https://cdn.pixabay.com/download/audio/2021/08/04/audio_4d1b5556de.mp3?filename=coin-collect-6466.mp3');
+const sndHit = new Audio('https://cdn.pixabay.com/download/audio/2021/08/09/audio_4f0b7cf2aa.mp3?filename=error-126627.mp3');
+
+/* Leaderboard cache to reduce requests */
+let leaderboardCache = null;
+async function fetchLeaderboard() {
+  const uid = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) ? tg.initDataUnsafe.user.id : null;
+  try {
+    const u = uid ? `?user_id=${uid}` : '';
+    const res = await fetch(`${SERVER_URL}/leaderboard${u}`);
+    if (!res.ok) return { top10: [], rank: null };
+    const j = await res.json();
+    leaderboardCache = j;
+    return j;
+  } catch(e) { return { top10: [], rank:null }; }
+}
+async function fetchMyTokens() {
+  if (!(tg && tg.initDataUnsafe && tg.initDataUnsafe.user)) return 0;
+  const uid = tg.initDataUnsafe.user.id;
+  try {
+    const res = await fetch(`${SERVER_URL}/my_tokens?user_id=${uid}`);
+    if (!res.ok) return 0;
+    const j = await res.json(); return j.tokens||0;
+  } catch(e) { return 0; }
+}
+
+async function fetchChannels() {
+  try {
+    const res = await fetch(`${SERVER_URL}/channels`);
+    if (!res.ok) return [];
+    const j = await res.json(); return j.channels || [];
+  } catch(e) { return []; }
+}
+
+/* Game mechanics (simplified) */
+function rand(min,max){ return Math.random()*(max-min)+min; }
+function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+function startGame(){ score=0; coins=[]; obstacles=[]; speedMultiplier=1; spawnInterval=700; state='playing'; lastSpawn=performance.now(); }
+function endGame(){
+  state='gameover'; highScore=Math.max(highScore,score); sndHit.currentTime=0; sndHit.play();
+  if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) {
+    const me = tg.initDataUnsafe.user;
+    fetch(`${SERVER_URL}/submit_score`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ user_id: me.id, name: me.username||me.first_name, score })
+    }).catch(()=>{});
+  }
+}
+
+/* spawn, update, draw - reuse previous behaviors with coin animation */
+function spawn(){
+  const now = performance.now();
+  if (now - lastSpawn < spawnInterval) return;
+  lastSpawn = now;
+  if (Math.random() < 0.2) {
+    obstacles.push({x: rand(40,W-80), y:-30, w: rand(40,100), h:12, vy: rand(1.2,2.6)*speedMultiplier});
+  } else {
+    coins.push({x: rand(24,W-24), y:-20, r:12, vy: rand(1.2,2.8)*speedMultiplier, value: Math.random()<0.08?5:1, anim:0});
+  }
+}
+
+function update(dt){
+  if (state !== 'playing') return;
+  if (touchX !== null) { const dx = touchX - player.x; player.vx = dx*0.06; } else player.vx *= 0.9;
+  player.x += player.vx * dt; player.x = clamp(player.x, player.w/2, W-player.w/2);
+  spawn();
+  for (let i=coins.length-1;i>=0;i--){
+    const c = coins[i]; c.vy += gravity*dt*0.06; c.y += c.vy*dt/16; c.anim += dt*0.01;
+    if (circleRectCollision(c.x,c.y,c.r, player.x-player.w/2, player.y-player.h/2, player.w, player.h)) {
+      score += c.value; sndCoin.currentTime=0; sndCoin.play(); coins.splice(i,1);
+      if (score % 10 === 0) { speedMultiplier += 0.06; spawnInterval = Math.max(350, spawnInterval-12); }
+      continue;
+    }
+    if (c.y - c.r > H) coins.splice(i,1);
+  }
+  for (let i=obstacles.length-1;i>=0;i--){
+    const o = obstacles[i]; o.vy += gravity*0.02*dt/16; o.y += o.vy*dt/16;
+    if (rectsOverlap(o.x,o.y,o.w,o.h, player.x-player.w/2, player.y-player.h/2, player.w, player.h)) endGame();
+    if (o.y - o.h > H) obstacles.splice(i,1);
+  }
+}
+
+function circleRectCollision(cx,cy,cr, rx,ry,rw,rh){
+  const closestX = clamp(cx, rx, rx+rw);
+  const closestY = clamp(cy, ry, ry+rh);
+  const dx = cx - closestX, dy = cy - closestY;
+  return dx*dx + dy*dy < cr*cr;
+}
+function rectsOverlap(x1,y1,w1,h1,x2,y2,w2,h2){
+  return !(x2>x1+w1 || x2+w2<x1 || y2>y1+h1 || y2+h2<y1);
+}
+
+/* Drawing UI */
+function drawPanel(title, subtitle, btnText){
+  const panelW = 300, panelH = 150;
+  const px = (W-panelW)/2, py = (H-panelH)/2;
+  ctx.fillStyle = 'rgba(6,10,16,0.6)'; ctx.fillRect(px,py,panelW,panelH);
+  ctx.fillStyle = '#fff'; ctx.textAlign='center'; ctx.font = '700 22px Arial'; ctx.fillText(title, W/2, py+38);
+  ctx.font = '14px Arial'; ctx.fillStyle = '#cdd6e0'; ctx.fillText(subtitle, W/2, py+72);
+  const bw = 140, bh = 36, bx = W/2 - bw/2, by = py + 96;
+  ctx.fillStyle = '#ffd166'; ctx.fillRect(bx,by,bw,bh);
+  ctx.fillStyle = '#08121a'; ctx.font = '700 16px Arial'; ctx.fillText(btnText, W/2, by+bh/2+2);
+  uiButton = {x:bx,y:by,w:bw,h:bh};
+}
+
+async function drawMenu(){
+  // draw background & stars
+  ctx.clearRect(0,0,W,H);
+  for(let i=0;i<60;i++){ const sx=(i*137.5)%W; const sy=((i*53.1)%H); ctx.fillStyle='rgba(255,255,255,0.03)'; ctx.fillRect(sx,sy,1,1); }
+
+  // header
+  ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='700 28px Arial'; ctx.fillText('Десятка', W/2, 60);
+  ctx.font='14px Arial'; ctx.fillStyle='#cdd6e0'; ctx.fillText('Собирай монеты, выполняй задания, копи златники', W/2, 86);
+
+  // leaderboard
+  const data = leaderboardCache || await fetchLeaderboard();
+  ctx.fillStyle='rgba(6,10,16,0.6)'; ctx.fillRect(30,110,W-60,220);
+  ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='700 18px Arial'; ctx.fillText('Таблица лидеров (топ-10 сегодня)', W/2, 136);
+  ctx.textAlign='left'; ctx.font='14px Arial';
+  let y = 156;
+  const leaders = data.top10 || [];
+  for (let i=0;i<10;i++){
+    const l = leaders[i];
+    if (l) {
+      ctx.fillStyle = (l.name === username) ? '#ffd166' : '#e9ecef';
+      ctx.fillText(`${i+1}. ${l.name}`, 52, y);
+      ctx.textAlign='right'; ctx.fillText(`${l.score}`, W-52, y);
+      ctx.textAlign='left';
+    } else {
+      ctx.fillStyle='#6f7784'; ctx.fillText(`${i+1}. —`, 52, y);
+    }
+    y += 22;
+  }
+  // my place
+  const rank = data.rank || '-';
+  ctx.fillStyle='#cdd6e0'; ctx.textAlign='center'; ctx.fillText(`Твоё место сегодня: ${rank}`, W/2, 350);
+
+  // Buttons: Play, Tasks, My Zlatniki, Rules
+  const bw = 140, bh = 40;
+  const bx = 36, by = 380;
+  // Play
+  ctx.fillStyle='#ffd166'; ctx.fillRect(W/2 - bw/2, by, bw, bh);
+  ctx.fillStyle='#08121a'; ctx.font='700 16px Arial'; ctx.textAlign='center'; ctx.fillText('Играть', W/2, by + bh/2 + 6);
+  // Tasks button right
+  ctx.fillStyle='#3a7bd5'; ctx.fillRect(W - bx - bw, by, bw, bh);
+  ctx.fillStyle='#fff'; ctx.fillText('Задания', W - bx - bw/2, by + bh/2 + 6);
+  // My Zlatniki small
+  ctx.fillStyle='#ffd166'; ctx.fillRect(36, by, 120, 36);
+  ctx.fillStyle='#08121a'; ctx.font='700 14px Arial'; ctx.textAlign='left'; ctx.fillText('Мои златники', 46, by + 24);
+  // Rules small
+  ctx.fillStyle='#6f7784'; ctx.fillRect(36, by + 46, 120, 32);
+  ctx.fillStyle='#fff'; ctx.fillText('Правила', 46, by + 46 + 22);
+
+  // store UI button hotspots
+  uiButton = {
+    play: { x: W/2 - bw/2, y: by, w: bw, h: bh },
+    tasks: { x: W - bx - bw, y: by, w: bw, h: bh },
+    tokens: { x: 36, y: by, w: 120, h: 36 },
+    rules: { x: 36, y: by + 46, w: 120, h: 32 }
+  };
+}
+
+function draw(){
+  if (state === 'menu') {
+    drawMenu();
+  } else if (state === 'playing') {
+    // draw game frame
+    ctx.clearRect(0,0,W,H);
+    for(let i=0;i<60;i++){ const sx=(i*137.5)%W; const sy=((i*53.1)%H); ctx.fillStyle='rgba(255,255,255,0.03)'; ctx.fillRect(sx,sy,1,1); }
+    for(const c of coins){
+      const scale = 1 + Math.sin(c.anim) * 0.2;
+      const g = ctx.createRadialGradient(c.x,c.y,0,c.x,c.y,c.r*2);
+      g.addColorStop(0,'rgba(255,230,120,0.95)'); g.addColorStop(0.6,'rgba(255,200,80,0.5)'); g.addColorStop(1,'rgba(255,200,80,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(c.x,c.y,c.r*1.9*scale,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#ffd166'; ctx.beginPath(); ctx.arc(c.x,c.y,c.r*scale,0,Math.PI*2); ctx.fill();
+    }
+    for(const o of obstacles){ ctx.fillStyle='rgba(255,80,80,0.9)'; ctx.fillRect(o.x,o.y,o.w,o.h); }
+    ctx.fillStyle='#83c5be'; ctx.fillRect(player.x-player.w/2, player.y-player.h/2, player.w, player.h);
+    ctx.fillStyle='#e9ecef'; ctx.font='700 20px Arial'; ctx.textAlign='left'; ctx.fillText('Score: '+score,14,28);
+    ctx.fillStyle='#bfc7d6'; ctx.font='12px Arial'; ctx.fillText('High: '+highScore, W-94, 28);
+  } else if (state === 'gameover') {
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='700 22px Arial'; ctx.fillText('Игра окончена', W/2, H/2 - 20);
+    ctx.font='16px Arial'; ctx.fillStyle='#cdd6e0'; ctx.fillText('Твой счёт: ' + score, W/2, H/2 + 6);
+    ctx.fillStyle='#ffd166'; ctx.fillRect(W/2 - 70, H/2 + 40, 140, 40);
+    uiButton = { x: W/2 - 70, y: H/2 + 40, w: 140, h: 40 };
+  }
+}
+
+canvas.addEventListener('mousedown', async (e) => {
+  const r = canvas.getBoundingClientRect(); const x = e.clientX - r.left, y = e.clientY - r.top;
+  if (state === 'menu') {
+    if (uiButton && uiButton.play && x >= uiButton.play.x && x <= uiButton.play.x + uiButton.play.w && y >= uiButton.play.y && y <= uiButton.play.y + uiButton.play.h) {
+      startGame(); state = 'playing';
+      return;
+    }
+    if (uiButton && uiButton.tasks && x >= uiButton.tasks.x && x <= uiButton.tasks.x + uiButton.tasks.w && y >= uiButton.tasks.y && y <= uiButton.tasks.y + uiButton.tasks.h) {
+      await showTasksModal(); return;
+    }
+    if (uiButton && uiButton.tokens && x >= uiButton.tokens.x && x <= uiButton.tokens.x + uiButton.tokens.w && y >= uiButton.tokens.y && y <= uiButton.tokens.y + uiButton.tokens.h) {
+      await showTokensModal(); return;
+    }
+    if (uiButton && uiButton.rules && x >= uiButton.rules.x && x <= uiButton.rules.x + uiButton.rules.w && y >= uiButton.rules.y && y <= uiButton.rules.y + uiButton.rules.h) {
+      showRulesModal(); return;
+    }
+  } else if (state === 'playing') {
+    touchX = x;
+  } else if (state === 'gameover') {
+    if (uiButton && x >= uiButton.x && x <= uiButton.x + uiButton.w && y >= uiButton.y && y <= uiButton.y + uiButton.h) {
+      state = 'menu';
+      leaderboardCache = await fetchLeaderboard();
+      draw();
+    }
+  }
+});
+canvas.addEventListener('mousemove', e=>{ const r = canvas.getBoundingClientRect(); touchX = e.clientX - r.left; });
+canvas.addEventListener('mouseup', ()=>{ touchX = null; });
+canvas.addEventListener('mouseleave', ()=>{ touchX = null; });
+canvas.addEventListener('touchstart', e=>{ e.preventDefault(); const r = canvas.getBoundingClientRect(); const x = e.touches[0].clientX - r.left, y = e.touches[0].clientY - r.top; if (state === 'menu') { /* handled in mousedown logic */ } else touchX = x; }, {passive:false});
+canvas.addEventListener('touchmove', e=>{ e.preventDefault(); const r = canvas.getBoundingClientRect(); touchX = e.touches[0].clientX - r.left; }, {passive:false});
+canvas.addEventListener('touchend', e=>{ e.preventDefault(); touchX = null; }, {passive:false});
+
+function loop(ts){ if (!lastTime) lastTime = ts; const dt = ts - lastTime; lastTime = ts; update(dt); draw(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+
+/* Modal / Tasks / Tokens UI (simple canvas overlay) */
+async function showTokensModal() {
+  const tokens = await fetchMyTokens();
+  // draw modal
+  ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(30,120,W-60,260);
+  ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='700 20px Arial'; ctx.fillText('Мои златники', W/2, 160);
+  ctx.font='700 44px Arial'; ctx.fillStyle='#ffd166'; ctx.fillText(String(tokens), W/2, 220);
+  ctx.font='14px Arial'; ctx.fillStyle='#cdd6e0'; ctx.fillText('Златники сохраняются и не обнуляются', W/2, 260);
+  ctx.fillStyle='#6f7784'; ctx.fillRect(W/2 - 70, 300, 140, 36);
+  ctx.fillStyle='#fff'; ctx.font='700 16px Arial'; ctx.fillText('Назад', W/2, 300 + 24);
+
+  // wait for click on 'Назад'
+  return new Promise(resolve => {
+    function onClick(e) {
+      const r = canvas.getBoundingClientRect(); const x = e.clientX - r.left, y = e.clientY - r.top;
+      if (x >= W/2 - 70 && x <= W/2 + 70 && y >= 300 && y <= 336) {
+        canvas.removeEventListener('mousedown', onClick);
+        resolve();
+      }
+    }
+    canvas.addEventListener('mousedown', onClick);
+  });
+}
+
+async function showTasksModal() {
+  // fetch channels + show invite button
+  const channels = await fetchChannels();
+  // draw modal background
+  ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(20,100,W-40,H-200);
+  ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='700 20px Arial'; ctx.fillText('Задания', W/2, 132);
+  ctx.font='14px Arial'; ctx.fillStyle='#cdd6e0'; ctx.fillText('Выполняй задания, чтобы заработать златники', W/2, 156);
+
+  // list: Invite friend, Subscribe to channels
+  let y = 180;
+  // Invite friend
+  ctx.fillStyle='#ffd166'; ctx.fillRect(40,y, W-80, 40); ctx.fillStyle='#08121a'; ctx.font='700 16px Arial'; ctx.fillText('Пригласи друга (+500)', W/2, y+26);
+  // subscribe channel button(s)
+  y += 56;
+  ctx.fillStyle='#e9ecef'; ctx.textAlign='left'; ctx.font='600 14px Arial';
+  ctx.fillText('Подписки:', 48, y); y += 20;
+  for (let ch of channels) {
+    ctx.fillStyle='#3a7bd5'; ctx.fillRect(48, y, W-96, 36);
+    ctx.fillStyle='#fff'; ctx.textAlign='left'; ctx.font='700 14px Arial'; ctx.fillText(`@${ch.username} (+${ch.reward})`, 58, y+22);
+    y += 44;
+  }
+  // Back button
+  ctx.fillStyle='#6f7784'; ctx.fillRect(W/2 - 70, H-80, 140, 36); ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='700 16px Arial'; ctx.fillText('Назад', W/2, H-80 + 24);
+
+  // click handling
+  return new Promise(resolve => {
+    function onClick(e) {
+      const r = canvas.getBoundingClientRect(); const x = e.clientX - r.left, y = e.clientY - r.top;
+      // Invite button
+      if (x >= 40 && x <= 40 + (W-80) && y >= 180 && y <= 180 + 40) {
+        // open invite share
+        openInvite();
+        return;
+      }
+      // channel buttons detection
+      let yy = 180 + 56;
+      for (let ch of channels) {
+        if (x >= 48 && x <= 48 + (W-96) && y >= yy && y <= yy + 36) {
+          // open channel link then verify
+          openChannelAndVerify(ch.username);
+          return;
+        }
+        yy += 44;
+      }
+      // Back
+      if (x >= W/2 - 70 && x <= W/2 + 70 && y >= H-80 && y <= H-44) {
+        canvas.removeEventListener('mousedown', onClick);
+        resolve();
+      }
+    }
+    canvas.addEventListener('mousedown', onClick);
+  });
+}
+
+/* Invite flow */
+function openInvite() {
+  if (!(tg && tg.initDataUnsafe && tg.initDataUnsafe.user)) {
+    alert('Открой игру через Telegram и попробуй ещё раз.');
+    return;
+  }
+  const me = tg.initDataUnsafe.user;
+  const inviterId = me.id;
+  const link = `https://t.me/${BOT_USERNAME}?start=${inviterId}`;
+  const share = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('Приходи играть в Десятка!')}`;
+  window.open(share, '_blank');
+  // Inviter will be credited when invited user opens the WebApp and claim_invite runs (server side)
+}
+
+/* Subscription verification flow */
+async function openChannelAndVerify(channelName) {
+  // open channel (user needs to subscribe manually)
+  const url = `https://t.me/${channelName}`;
+  window.open(url, '_blank');
+  // then show "Проверить" prompt
+  const ok = confirm('После подписки нажмите OK, чтобы проверить и получить вознаграждение.');
+  if (!ok) return;
+  if (!(tg && tg.initDataUnsafe && tg.initDataUnsafe.user)) {
+    alert('Открой игру через Telegram и попробуй ещё раз.');
+    return;
+  }
+  const uid = tg.initDataUnsafe.user.id;
+  try {
+    const res = await fetch(`${SERVER_URL}/claim_subscribe`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ user_id: uid, channel: channelName })
+    });
+    const j = await res.json();
+    if (j.credited) {
+      alert(`Готово! Тебе начислено +${j.reward} златников.`);
+    } else {
+      if (j.reason === 'not_member') alert('Похоже, ты не подписался или подписка не подтверждена ботом. Проверь и попробуй снова.');
+      else if (j.reason === 'already_claimed') alert('Ты уже получил вознаграждение за эту подписку.');
+      else alert('Не удалось проверить подписку. Попробуй ещё раз позже.');
+    }
+  } catch(e) {
+    alert('Ошибка проверки подписки. Попробуй позже.');
+  }
+}
+
+/* Rules modal */
+function showRulesModal() {
+  ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(30,120,W-60,280);
+  ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='700 18px Arial'; ctx.fillText('Правила игры "Десятка"', W/2, 150);
+  ctx.font='14px Arial'; ctx.fillStyle='#cdd6e0';
+  const txt = [
+    'Зарабатывай златники собирая монеты и выполняя задания.',
+    'Каждый день рейтинг (топ-10) обновляется в 06:00 и обнуляется.',
+    'В топ-10 начисляются дополнительные златники — 1 место 100, 2 место 70, 3 место 50, 6-10 места по 30.',
+    'Всем остальным участникам дня начисляется по 5 златников.',
+    'Златники не обнуляются и сохраняются в твоём аккаунте.',
+    'Скоро златники можно будет вывести как реальные вознаграждения.'
+  ];
+  let y = 180;
+  ctx.textAlign='left';
+  for (let line of txt) { ctx.fillText(line, 48, y); y += 22; }
+  ctx.fillStyle='#6f7784'; ctx.fillRect(W/2 - 70, H-80, 140, 36); ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='700 16px Arial'; ctx.fillText('Назад', W/2, H-80 + 24);
+
+  return new Promise(resolve => {
+    function onClick(e) {
+      const r = canvas.getBoundingClientRect(); const x = e.clientX - r.left, y = e.clientY - r.top;
+      if (x >= W/2 - 70 && x <= W/2 + 70 && y >= H-80 && y <= H-44) {
+        canvas.removeEventListener('mousedown', onClick); resolve();
+      }
+    }
+    canvas.addEventListener('mousedown', onClick);
+  });
+}
+
+/* Resize handling */
+function resizeCanvas(){ const scale = Math.min(window.innerWidth/420, window.innerHeight/740, 1); canvas.style.transform = `scale(${scale})`; canvas.style.transformOrigin='left top'; }
+window.addEventListener('resize', resizeCanvas); resizeCanvas();
+
+</script>
+</body>
+</html>
